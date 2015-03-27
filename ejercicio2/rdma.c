@@ -40,6 +40,7 @@ struct app_context{
 	void               		*buf;
 	unsigned            	size;
 	int                 	tx_depth;
+        int                     rx_depth;
 	struct ibv_sge      	sge_list;
 	struct ibv_send_wr  	wr;
 };
@@ -57,8 +58,10 @@ struct app_data {
 	int							ib_port;
 	unsigned            		size;
 	int                 		tx_depth;
+        int                             rx_depth;
 	int 		    			sockfd;
 	char						*servername;
+        char *mode;
 	struct ib_connection		local_connection;
 	struct ib_connection 		*remote_connection;
 	struct ibv_device			*ib_dev;
@@ -85,9 +88,12 @@ static int qp_change_state_rtr(struct ibv_qp *qp, struct app_data *data);
 static int qp_change_state_rts(struct ibv_qp *qp, struct app_data *data);
 
 static void rdma_write(struct app_context *ctx, struct app_data *data);
+static void rdma_read(struct app_context *ctx, struct app_data *data);
 
 int main(int argc, char *argv[])
 {
+        srand((unsigned) time(NULL));
+	
 	struct app_context 		*ctx = NULL;
 	char                    *ib_devname = NULL;
 	int                   	iters = 1000;
@@ -96,31 +102,45 @@ int main(int argc, char *argv[])
 	struct ibv_qp			*qp;
 
 	struct app_data	 	 data = {
-		.port	    		= 18515,
+ 	        .port	    		= 18000 + (rand() % 7000),
 		.ib_port    		= 1,
 		.size       		= 65536,
 		.tx_depth   		= 100,
+                .rx_depth               = 100,
 		.servername 		= NULL,
 		.remote_connection 	= NULL,
-		.ib_dev     		= NULL
+		.ib_dev     		= NULL,
+		.mode                   = NULL
 		
 	};
 
-	if(argc == 2){
-		data.servername = argv[1];
+	if(argc == 4){
+	        printf("*** Client side\n");
+	        data.servername = argv[1];
+		data.mode = argv[2];
+		data.port = atoi(argv[3]);
 	}
-	if(argc > 2){
-		die("*Error* Usage: rdma <server>\n");
+
+	if(argc == 2){
+	        printf("*** Server side\n");
+		data.mode = argv[1];
+	}
+
+	if(argc < 2 || argc > 4 || ((strcmp(data.mode, "read") != 0) && (strcmp(data.mode, "write") != 0))){
+		die("*Error* Usage: rdma [<server-addr>] <mode> <port>\n\t<mode>:\t is the RDMA \"read\" or \"write\" mode\n\t<server-addr>:\t is server's hostname or IB interface IP (only required in the client side)");
 	}
 
 	pid = getpid();
 
 	if(!data.servername){
 		// Print app parameters. This is basically from rdma_bw app. Most of them are not used atm
-		printf("PID=%d | port=%d | ib_port=%d | size=%d | tx_depth=%d | sl=%d |\n",
-			pid, data.port, data.ib_port, data.size, data.tx_depth, sl);
+		printf("PID=%d | port=%d | ib_port=%d | size=%d | tx_depth=%d | rx_depth=%d | mode=%s | sl=%d |\n",
+		       pid, data.port, data.ib_port, data.size, data.tx_depth, data.rx_depth, data.mode, sl);
 	}
-
+	else{
+	  printf("PID=%d | port=%d\n", pid, data.port); 
+	}
+	
 	// Is later needed to create random number for psn
 	srand48(pid * time(NULL));
 	
@@ -145,26 +165,38 @@ int main(int argc, char *argv[])
 	print_ib_connection("Local  Connection", &data.local_connection);
 	print_ib_connection("Remote Connection", data.remote_connection);	
 
-	if(data.servername){
-		qp_change_state_rtr(ctx->qp, &data);
-	}else{
-		qp_change_state_rts(ctx->qp, &data);
-	}	
+	/* RDMA Write */
+	if(strcmp(data.mode,"write") == 0){
 
-	if(!data.servername){
-		/* Server - RDMA WRITE */
-		printf("Server. Writing to Client-Buffer (RDMA-WRITE)\n");
+	  if(data.servername){
+	    // Client/Responder QP in RTR (Ready to receive) 
+	    qp_change_state_rtr(ctx->qp, &data);
+
+	  }else{
+	    // Server/Requester QP in RTS (Ready to send) 
+	    qp_change_state_rts(ctx->qp, &data);
+
+	  }	
+
+	  if(!data.servername){
+	    
+	        // Server/Requester side
+
+		printf("Server (Requester): writing to Client-Buffer (RDMA-WRITE)\n");
 
 		// For now, the message to be written into the clients buffer can be edited here
 		char *chPtr = ctx->buf;
-		strcpy(chPtr,"Saluton Teewurst. UiUi");
+		strcpy(chPtr,"RDMA Write -> Hello World");
 
 		rdma_write(ctx, &data);
 		
-	}else{
-		/* Client - Read local buffer */
-		printf("Client. Reading Local-Buffer (Buffer that was registered with MR)\n");
-		
+	  }else{
+
+	        // Client/Responder - Read local buffer 
+
+		printf("Client (Responder): reading Local-Buffer (Buffer that was registered with MR)\n");
+
+		// Buffer is expected to receive the data from the Requester
 		char *chPtr = (char *)data.local_connection.vaddr;
 			
 		while(1){
@@ -174,9 +206,55 @@ int main(int argc, char *argv[])
 		}
 		
 		printf("Printing local buffer: %s\n" ,chPtr);
+	  }
 	
 	}
-	
+	else if(strcmp(data.mode,"read") == 0){
+
+	  // RDMA Read 
+	  
+          if(!data.servername){
+            // Client/Responder QP in RTS (Ready to Send) 
+            qp_change_state_rts(ctx->qp, &data);
+	    
+          }else{
+            // Server/Requester QP in RTR (Ready to receive) 
+            qp_change_state_rtr(ctx->qp, &data);
+	    
+          }
+
+          if(!data.servername){
+
+	    // Server/Requester side                                                                             
+
+	    printf("Server (Requester): reading Local-Buffer (Buffer that was registered with MR)\n");
+
+            // Buffer is expected to receive the data from the Responder
+	    char *chPtr = ctx->buf;
+	    rdma_read(ctx, &data);
+
+	    /* TODO: Requester has to do something here */
+
+            printf("Printing local buffer: %s\n" ,chPtr);
+
+          }else{
+
+	    // Client/Responder - Read local buffer                                                              
+
+	    printf("Client (Responder): writing to Server/Requester-Buffer (RDMA-READ)\n");
+
+	    char *chPtr = (char *)data.local_connection.vaddr;
+
+	    /*TODO: Responder has to do something here */
+
+	    printf("MSG %s written int the buffer. Leaving...\n", chPtr);
+
+          }
+	}
+	else{
+	  printf("The parameter <mode> (read/write) has not been configured properly\n");
+	}
+
 	printf("Destroying IB context\n");
 	destroy_ctx(ctx);
 	
@@ -286,6 +364,7 @@ static struct app_context *init_ctx(struct app_data *data)
 	
 	ctx->size = data->size;
 	ctx->tx_depth = data->tx_depth;
+	ctx->rx_depth = data->rx_depth;
 	
 	TEST_NZ(posix_memalign(&ctx->buf, page_size, ctx->size * 2),
 				"could not allocate working buffer ctx->buf");
@@ -318,7 +397,7 @@ static struct app_context *init_ctx(struct app_data *data)
 	TEST_Z(ctx->ch = ibv_create_comp_channel(ctx->context),
 			"Could not create completion channel, ibv_create_comp_channel");
 
-	TEST_Z(ctx->rcq = ibv_create_cq(ctx->context, 1, NULL, NULL, 0),
+	TEST_Z(ctx->rcq = ibv_create_cq(ctx->context, ctx->rx_depth, ctx, ctx->ch, 0),
 			"Could not create receive completion queue, ibv_create_cq");	
 
 	TEST_Z(ctx->scq = ibv_create_cq(ctx->context,ctx->tx_depth, ctx, ctx->ch, 0),
@@ -330,7 +409,7 @@ static struct app_context *init_ctx(struct app_data *data)
 		.qp_type = IBV_QPT_RC,
 		.cap = {
 			.max_send_wr = ctx->tx_depth,
-			.max_recv_wr = 1,
+			.max_recv_wr = ctx->rx_depth,
 			.max_send_sge = 1,
 			.max_recv_sge = 1,
 			.max_inline_data = 0
@@ -570,9 +649,6 @@ static void rdma_write(struct app_context *ctx, struct app_data *data){
     TEST_NZ(ibv_post_send(ctx->qp,&ctx->wr,&bad_wr),
         "ibv_post_send failed. This is bad mkay");
 
-	// Conrols if message was competely sent. But fails if client destroys his context to early. This would have to
-	// be timed by the server telling the client that the rdma_write has been completed.
-	/*
     int ne;
     struct ibv_wc wc;
 
@@ -596,5 +672,13 @@ static void rdma_write(struct app_context *ctx, struct app_data *data){
         printf("wrid: %i successfull\n",(int)wc.wr_id);
         printf("%i bytes transfered\n",(int)wc.byte_len);
     }
-	*/
+	
 }	
+
+static void rdma_read(struct app_context *ctx, struct app_data *data){
+
+  /*TODO: Implement this method */
+  printf("Not implemented yet\n");
+  exit(1);
+
+}
